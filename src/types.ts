@@ -3,7 +3,7 @@ export interface Point {
     y: number;
 }
 
-export type DocumentType = 'Passport' | 'Aadhaar' | 'PAN' | 'Driving License' | 'Unknown';
+export type DocumentType = 'ID Card' | 'Aadhaar Letter' | 'Passport' | 'Aadhaar' | 'PAN' | 'Driving License' | 'Unknown';
 
 export interface DetectionResult {
     status: 'searching' | 'detected' | 'centered';

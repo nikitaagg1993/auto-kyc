@@ -17,7 +17,7 @@ const CameraView: React.FC = () => {
 
     // Auto-capture logic
     const stabilityCounter = useRef(0);
-    const REQUIRED_STABLE_FRAMES = 10; // Approx 2 seconds at 5fps
+    const REQUIRED_STABLE_FRAMES = 3; // ~0.6 seconds at 5fps
 
     const captureImage = useCallback(() => {
         if (!videoRef.current) return;

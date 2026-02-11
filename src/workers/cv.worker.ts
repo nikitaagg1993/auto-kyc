@@ -2,7 +2,6 @@
 /* eslint-disable no-restricted-globals */
 
 type DetectionResult = any;
-type Point = any;
 
 declare const self: DedicatedWorkerGlobalScope & { cv: any };
 
@@ -33,121 +32,129 @@ function loadOpenCV(url: string) {
 
 let frameCount = 0;
 
+/**
+ * Strategy inspired by jscanify:
+ *   Canny → blur → threshold → findContours → sort by area → pick largest 4-sided one
+ * 
+ * Added for handheld card detection:
+ *   - Require approxPolyDP to give 4 vertices (it's a rectangle)
+ *   - Require card-like aspect ratio (1.2-2.0 for CR80 landscape, or 0.5-0.85 for A4 portrait)
+ *   - Minimum area 5% of frame (to skip tiny noise)
+ *   - Skip contours that span the full frame (face/background)
+ */
 function processFrame(imageData: ImageData) {
     if (!cv) return;
     frameCount++;
 
     try {
         const src = cv.matFromImageData(imageData);
-        const gray = new cv.Mat();
-        const blurred = new cv.Mat();
-        const thresh = new cv.Mat();
-        const contours = new cv.MatVector();
-        const hierarchy = new cv.Mat();
-
         const totalArea = src.cols * src.rows;
 
-        // 1. Preprocessing — use multiple approaches
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-
-        // Use adaptive threshold — works better for cards with varied backgrounds
-        cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
-
-        // Morphological close to merge nearby edges into solid regions
-        const closeKernel = cv.Mat.ones(7, 7, cv.CV_8U);
-        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, closeKernel);
-        closeKernel.delete();
-
-        // Dilate to further solidify the card boundary
-        const dilateKernel = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.dilate(thresh, thresh, dilateKernel);
-        dilateKernel.delete();
-
-        // 2. Find Contours
-        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-        // Also try Canny as a fallback
+        // Step 1: Canny edge detection on the raw image (following jscanify approach)
         const edges = new cv.Mat();
-        cv.Canny(blurred, edges, 50, 150);
-        const edgeKernel = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.dilate(edges, edges, edgeKernel);
-        edgeKernel.delete();
+        cv.Canny(src, edges, 50, 200);
 
-        const contours2 = new cv.MatVector();
-        const hierarchy2 = new cv.Mat();
-        cv.findContours(edges, contours2, hierarchy2, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        // Step 2: Gaussian blur on edges to connect nearby edge fragments
+        const blurred = new cv.Mat();
+        cv.GaussianBlur(edges, blurred, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
 
-        // Merge all candidate contours
-        const allContours: any[] = [];
+        // Step 3: Otsu threshold to get binary edge image
+        const binary = new cv.Mat();
+        cv.threshold(blurred, binary, 0, 255, cv.THRESH_OTSU);
+
+        // Step 4: Dilate to close small gaps in edges
+        const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
+        cv.dilate(binary, binary, kernel);
+        kernel.delete();
+
+        // Step 5: Find contours
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
+
+        if (frameCount % 15 === 0) {
+            console.log(`[CV] Frame ${frameCount}: ${contours.size()} contours found`);
+        }
+
+        // Step 6: Sort contours by area (descending) and find the largest quad
+        let candidates: { contour: any; area: number; approx: any }[] = [];
         for (let i = 0; i < contours.size(); i++) {
-            allContours.push(contours.get(i));
-        }
-        for (let i = 0; i < contours2.size(); i++) {
-            allContours.push(contours2.get(i));
-        }
-
-        if (frameCount % 10 === 0) {
-            console.log(`[CV] Frame ${frameCount}: ${src.cols}x${src.rows}, candidates: ${allContours.length}`);
-        }
-
-        let bestScore = 0;
-        let bestRect: any = null;
-        let bestContour: any = null;
-
-        // 3. For each contour, use minAreaRect to find the best rotated rectangle
-        for (let i = 0; i < allContours.length; i++) {
-            const cnt = allContours[i];
+            const cnt = contours.get(i);
             const area = cv.contourArea(cnt);
+            candidates.push({ contour: cnt, area, approx: null });
+        }
+        candidates.sort((a, b) => b.area - a.area);
 
-            // Card should be 5-50% of the frame
-            if (area < totalArea * 0.05 || area > totalArea * 0.50) continue;
+        // Only check top 20 largest contours (performance)
+        const toCheck = candidates.slice(0, 20);
 
-            // Reject contours that touch the frame border (usually the frame edge itself)
-            const br = cv.boundingRect(cnt);
-            const margin = 5;
-            if (br.x < margin || br.y < margin ||
-                br.x + br.width > src.cols - margin ||
-                br.y + br.height > src.rows - margin) continue;
+        let bestContour: any = null;
+        let bestApprox: any = null;
+        let bestArea = 0;
+        let bestAR = 0;
 
-            // Get the minimum area rotated rectangle
-            const rotatedRect = cv.minAreaRect(cnt);
-            let w = rotatedRect.size.width;
-            let h = rotatedRect.size.height;
+        for (const cand of toCheck) {
+            const { contour, area } = cand;
 
-            // Ensure w > h for consistent aspect ratio
-            if (h > w) { const tmp = w; w = h; h = tmp; }
+            // Skip too small (< 2% of frame) or too large (> 60% of frame)
+            if (area < totalArea * 0.02 || area > totalArea * 0.60) continue;
 
-            const aspectRatio = w / h;
+            // Approximate polygon - use 0.05 epsilon for more aggressive simplification
+            const peri = cv.arcLength(contour, true);
+            const approx = new cv.Mat();
+            cv.approxPolyDP(contour, approx, 0.05 * peri, true);
 
-            // Card-like aspect ratio: ID-1 cards are ~1.586
-            // Allow range 1.3 to 1.85 for cards at angles
-            if (aspectRatio < 1.3 || aspectRatio > 1.85) continue;
-
-            // Fill ratio: how well does the contour fill its rotated rect?
-            const rectArea = w * h;
-            const fillRatio = area / rectArea;
-
-            // For handheld cards, fill can be lower due to fingers — require > 0.4
-            if (fillRatio < 0.4) continue;
-
-            // Score: prefer larger area and better fill
-            const score = area * fillRatio;
-
-            if (frameCount % 10 === 0) {
-                console.log(`[CV] Candidate: area=${Math.round(area)} (${(area / totalArea * 100).toFixed(1)}%), AR=${aspectRatio.toFixed(3)}, fill=${fillRatio.toFixed(2)}, score=${Math.round(score)}`);
+            // Log top-5 largest contours for diagnostics
+            const idx = toCheck.indexOf(cand);
+            if (frameCount % 15 === 0 && idx < 5) {
+                console.log(`[CV]   #${idx}: vertices=${approx.rows}, area=${(area / totalArea * 100).toFixed(1)}%`);
             }
 
-            if (score > bestScore) {
-                bestScore = score;
-                bestRect = {
-                    x: Math.round(rotatedRect.center.x - w / 2),
-                    y: Math.round(rotatedRect.center.y - h / 2),
-                    width: Math.round(w),
-                    height: Math.round(h),
-                    angle: rotatedRect.angle
-                };
-                bestContour = cnt;
+            // Must be roughly rectangular (4-6 vertices - fingers can add extra)
+            if (approx.rows < 4 || approx.rows > 6) {
+                approx.delete();
+                continue;
+            }
+
+            // Compute aspect ratio from the bounding rect of the 4-point polygon
+            const rect = cv.boundingRect(approx);
+
+            // Skip if bounding rect covers nearly the entire frame
+            if (rect.width > src.cols * 0.90 && rect.height > src.rows * 0.90) {
+                approx.delete();
+                continue;
+            }
+
+            const w = Math.max(rect.width, rect.height);
+            const h = Math.min(rect.width, rect.height);
+            const aspectRatio = w / h;
+
+            // Check if it has a card-like aspect ratio
+            // CR80 (PAN/Aadhaar/DL): AR ~1.585 → range 1.2-2.0
+            // A4 (Aadhaar letter): AR ~1.414 → range 1.2-1.6
+            // Passport: AR ~1.42 → range 1.2-1.6
+            // Using wide range: 1.2 to 2.0
+            if (aspectRatio < 1.2 || aspectRatio > 2.0) {
+                if (frameCount % 15 === 0) {
+                    console.log(`[CV]   Rejected quad: AR=${aspectRatio.toFixed(2)}, area=${(area / totalArea * 100).toFixed(1)}%`);
+                }
+                approx.delete();
+                continue;
+            }
+
+            if (frameCount % 15 === 0) {
+                console.log(`[CV]   ✓ Quad found: AR=${aspectRatio.toFixed(2)}, area=${(area / totalArea * 100).toFixed(1)}%, ${rect.width}x${rect.height}`);
+            }
+
+            // Use the largest valid quad
+            if (area > bestArea) {
+                if (bestApprox) bestApprox.delete();
+                bestContour = contour;
+                bestApprox = approx;
+                bestArea = area;
+                bestAR = aspectRatio;
+            } else {
+                approx.delete();
             }
         }
 
@@ -157,68 +164,59 @@ function processFrame(imageData: ImageData) {
             message: 'Looking for document...'
         };
 
-        if (bestRect && bestContour) {
+        if (bestContour && bestApprox) {
             result.status = 'detected';
 
-            // Get standard bounding rect for overlay
-            const boundRect = cv.boundingRect(bestContour);
+            const rect = cv.boundingRect(bestApprox);
             result.box = {
-                x: boundRect.x,
-                y: boundRect.y,
-                width: boundRect.width,
-                height: boundRect.height,
+                x: rect.x, y: rect.y,
+                width: rect.width, height: rect.height,
                 corners: [
-                    { x: boundRect.x, y: boundRect.y },
-                    { x: boundRect.x + boundRect.width, y: boundRect.y },
-                    { x: boundRect.x + boundRect.width, y: boundRect.y + boundRect.height },
-                    { x: boundRect.x, y: boundRect.y + boundRect.height },
+                    { x: rect.x, y: rect.y },
+                    { x: rect.x + rect.width, y: rect.y },
+                    { x: rect.x + rect.width, y: rect.y + rect.height },
+                    { x: rect.x, y: rect.y + rect.height },
                 ]
             };
 
-            // Classification based on rotated rect aspect ratio
-            const ar = bestRect.width / bestRect.height;
-
-            // All Indian ID cards are ISO ID-1 size (~1.586 ratio)
-            // We can't reliably distinguish PAN vs Aadhaar by shape alone
-            // For now, label based on slight ratio differences
-            if (ar > 1.5) {
-                result.documentType = 'PAN / Aadhaar';
+            // Classification
+            if (bestAR >= 1.4 && bestAR <= 1.75) {
+                result.documentType = 'ID Card'; // PAN / Aadhaar PVC / DL (all CR80)
+            } else if (bestAR > 1.75) {
+                result.documentType = 'ID Card'; // Slightly wider card
             } else {
-                result.documentType = 'ID Card';
+                result.documentType = 'ID Card'; // Default to ID Card for any valid quad
             }
 
-            console.log(`[CV] ✅ DETECTED: type=${result.documentType}, AR=${ar.toFixed(3)}, area=${Math.round(bestScore)}, rect=${bestRect.width}x${bestRect.height}`);
+            console.log(`[CV] ✅ DETECTED: ${result.documentType}, AR=${bestAR.toFixed(2)}, area=${(bestArea / totalArea * 100).toFixed(1)}%, ${rect.width}x${rect.height}`);
 
-            // Check if centered
-            const centerX = boundRect.x + boundRect.width / 2;
-            const centerY = boundRect.y + boundRect.height / 2;
-            const imgCenterX = src.cols / 2;
-            const imgCenterY = src.rows / 2;
-            const tolerance = src.cols * 0.18;
+            // Check centering
+            const cx = rect.x + rect.width / 2;
+            const cy = rect.y + rect.height / 2;
+            const tol = src.cols * 0.18;
 
-            if (Math.abs(centerX - imgCenterX) < tolerance && Math.abs(centerY - imgCenterY) < tolerance) {
+            if (Math.abs(cx - src.cols / 2) < tol && Math.abs(cy - src.rows / 2) < tol) {
                 result.status = 'centered';
                 result.message = 'Hold Still...';
-                console.log(`[CV] 🎯 CENTERED!`);
+                console.log(`[CV] 🎯 CENTERED`);
             } else {
                 result.message = 'Center the document';
             }
+
+            bestApprox.delete();
         } else if (frameCount % 15 === 0) {
-            console.log(`[CV] ❌ No card detected.`);
+            console.log(`[CV] ❌ No card detected`);
         }
 
         self.postMessage({ type: 'DETECTION_RESULT', payload: result });
 
         // Cleanup
         src.delete();
-        gray.delete();
-        blurred.delete();
-        thresh.delete();
         edges.delete();
+        blurred.delete();
+        binary.delete();
         contours.delete();
         hierarchy.delete();
-        contours2.delete();
-        hierarchy2.delete();
 
     } catch (e) {
         console.error("CV Processing Error", e);

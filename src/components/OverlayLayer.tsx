@@ -9,15 +9,19 @@ interface OverlayLayerProps {
 }
 
 const OverlayLayer: React.FC<OverlayLayerProps> = ({ detectionResult }) => {
+    // Determine guide orientation based on detected document type
+    const isA4Document = detectionResult?.documentType === 'Aadhaar Letter' ||
+        detectionResult?.documentType === 'Passport';
+
     // Styles for the card guide
     const guideStyle = {
         position: 'absolute' as 'absolute',
         top: '50%',
         left: '50%',
         transform: 'translate(-50%, -50%)',
-        width: '85%', // Approximate card width relative to screen
-        maxWidth: '400px',
-        aspectRatio: '1.586', // Credit card ratio
+        width: isA4Document ? '85%' : '95%', // Wider guide boxes
+        maxWidth: isA4Document ? '600px' : '800px',
+        aspectRatio: isA4Document ? '0.707' : '1.586', // A4 portrait or CR80 landscape
         border: '2px dashed rgba(255, 255, 255, 0.5)',
         borderRadius: '12px',
         boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.5)', // Dim background
