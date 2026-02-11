@@ -96,31 +96,48 @@ function processFrame(imageData: ImageData) {
         for (const cand of toCheck) {
             const { contour, area } = cand;
 
-            // Skip too small (< 2% of frame) or too large (> 60% of frame)
-            if (area < totalArea * 0.02 || area > totalArea * 0.60) continue;
+            // Skip too small (< 3% of frame) or too large (> 40% of frame)
+            if (area < totalArea * 0.03 || area > totalArea * 0.40) continue;
 
-            // Approximate polygon - use 0.05 epsilon for more aggressive simplification
+            // Approximate polygon
             const peri = cv.arcLength(contour, true);
             const approx = new cv.Mat();
-            cv.approxPolyDP(contour, approx, 0.05 * peri, true);
+            cv.approxPolyDP(contour, approx, 0.04 * peri, true);
 
             // Log top-5 largest contours for diagnostics
             const idx = toCheck.indexOf(cand);
             if (frameCount % 15 === 0 && idx < 5) {
-                console.log(`[CV]   #${idx}: vertices=${approx.rows}, area=${(area / totalArea * 100).toFixed(1)}%`);
+                console.log(`[CV]   #${idx}: v=${approx.rows}, area=${(area / totalArea * 100).toFixed(1)}%`);
             }
 
-            // Must be roughly rectangular (4-6 vertices - fingers can add extra)
-            if (approx.rows < 4 || approx.rows > 6) {
+            // Must be a quadrilateral (exactly 4 vertices)
+            if (approx.rows !== 4) {
                 approx.delete();
                 continue;
             }
 
-            // Compute aspect ratio from the bounding rect of the 4-point polygon
+            // Must be convex — real cards are convex rectangles
+            if (!cv.isContourConvex(approx)) {
+                approx.delete();
+                continue;
+            }
+
+            // Bounding rect
             const rect = cv.boundingRect(approx);
 
-            // Skip if bounding rect covers nearly the entire frame
-            if (rect.width > src.cols * 0.90 && rect.height > src.rows * 0.90) {
+            // Reject contours touching the frame edge (15px margin)
+            const margin = 15;
+            if (rect.x < margin || rect.y < margin ||
+                rect.x + rect.width > src.cols - margin ||
+                rect.y + rect.height > src.rows - margin) {
+                approx.delete();
+                continue;
+            }
+
+            // Fill ratio: contour area vs bounding rect area
+            // A real card contour should fill most of its bounding rect
+            const fillRatio = area / (rect.width * rect.height);
+            if (fillRatio < 0.5) {
                 approx.delete();
                 continue;
             }
@@ -129,14 +146,10 @@ function processFrame(imageData: ImageData) {
             const h = Math.min(rect.width, rect.height);
             const aspectRatio = w / h;
 
-            // Check if it has a card-like aspect ratio
-            // CR80 (PAN/Aadhaar/DL): AR ~1.585 → range 1.2-2.0
-            // A4 (Aadhaar letter): AR ~1.414 → range 1.2-1.6
-            // Passport: AR ~1.42 → range 1.2-1.6
-            // Using wide range: 1.2 to 2.0
-            if (aspectRatio < 1.2 || aspectRatio > 2.0) {
+            // CR80 card AR = 1.585 → tight range 1.4-1.7
+            if (aspectRatio < 1.4 || aspectRatio > 1.7) {
                 if (frameCount % 15 === 0) {
-                    console.log(`[CV]   Rejected quad: AR=${aspectRatio.toFixed(2)}, area=${(area / totalArea * 100).toFixed(1)}%`);
+                    console.log(`[CV]   Rejected: AR=${aspectRatio.toFixed(2)}, fill=${fillRatio.toFixed(2)}, area=${(area / totalArea * 100).toFixed(1)}%`);
                 }
                 approx.delete();
                 continue;
