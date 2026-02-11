@@ -51,9 +51,8 @@ const CameraView: React.FC = () => {
     // KEY FIX: Include isCvLoaded as a dependency so this effect re-runs
     // AFTER the loading screen is replaced by the <video> element.
     useEffect(() => {
-        if (videoRef.current && stream) {
+        if (videoRef.current && stream && videoRef.current.srcObject !== stream) {
             videoRef.current.srcObject = stream;
-            videoRef.current.play().catch((e) => console.error('Video play error:', e));
         }
     }, [stream, isCvLoaded, capturedImage]);
 
@@ -107,9 +106,12 @@ const CameraView: React.FC = () => {
                 ref={(el) => {
                     // Ref callback: attach stream as soon as the element mounts
                     (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
-                    if (el && stream && !el.srcObject) {
+                    if (el && stream && el.srcObject !== stream) {
                         el.srcObject = stream;
-                        el.play().catch((e) => console.error('Video play error:', e));
+                        // Only call play if not already playing
+                        if (el.paused) {
+                            el.play().catch(() => { /* autoPlay handles this */ });
+                        }
                     }
                 }}
                 autoPlay

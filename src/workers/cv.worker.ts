@@ -113,8 +113,8 @@ function processFrame(imageData: ImageData) {
 
             const aspectRatio = w / h;
 
-            // CR80 card AR = 1.585 → widened range 1.25-1.8 for perspective distortion
-            if (aspectRatio < 1.25 || aspectRatio > 1.8) {
+            // CR80 card AR = 1.585 → range 1.35-1.8 (handles perspective, rejects faces at ~1.25)
+            if (aspectRatio < 1.35 || aspectRatio > 1.8) {
                 if (frameCount % 15 === 0 && i < 3) {
                     console.log(`[CV]   #${i}(${source}): AR=${aspectRatio.toFixed(2)} SKIP, area=${(area / totalArea * 100).toFixed(1)}%`);
                 }
@@ -122,10 +122,10 @@ function processFrame(imageData: ImageData) {
             }
 
             // Fill ratio: contour area vs rotated rect area
-            // A real card should fill at least 60% of its rotated bounding rect
+            // Cards fill ~0.85+ of their bounding rect, faces fill ~0.6-0.7
             const rectArea = w * h;
             const fillRatio = area / rectArea;
-            if (fillRatio < 0.60) {
+            if (fillRatio < 0.75) {
                 if (frameCount % 15 === 0 && i < 5) {
                     console.log(`[CV]   #${i}(${source}): fill=${fillRatio.toFixed(2)} SKIP, AR=${aspectRatio.toFixed(2)}`);
                 }
